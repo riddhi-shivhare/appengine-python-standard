@@ -31,9 +31,11 @@ can be used, which will translate task names into URLs relative to a queue's
 base path. A default queue is also provided for simple usage.
 """
 
+import base64
 import calendar
 import datetime
 import logging
+import json
 import math
 import os
 import re
@@ -51,17 +53,85 @@ import six
 from six.moves import urllib
 import six.moves.urllib.parse
 
+try:
+    import urllib.request as urllib_request
+    import urllib.error as urllib_error
+except ImportError:
+    import urllib2 as urllib_request
+    import urllib2 as urllib_error
+
+# New imports for Cloud Tasks migration
+try:
+    import google.auth
+    from google.auth.transport.requests import Request as AuthRequest
+    import urllib.request as urllib_req
+    from google.cloud import tasks_v2beta3
+    from google.api_core import exceptions as api_core_exceptions
+    from google.protobuf import field_mask_pb2
+    import asyncio
+    google_auth_present = True
+except ImportError:
+    google = None
+    google_auth_present = False
+    logging.warning("google-auth or google-cloud-tasks not found. Cloud Tasks redirection will not work.")
+
+def _GetTaskForCloudTasks(add_req, project, location):
+    queue_name_str = add_req.queue_name.decode('utf-8')
+    parent = 'projects/%s/locations/%s/queues/%s' % (project, location, queue_name_str)
+    _METHOD_MAP_INT_TO_STR = {1: 'GET', 2: 'POST', 3: 'HEAD', 4: 'PUT', 5: 'DELETE'}
+    method_str = _METHOD_MAP_INT_TO_STR.get(add_req.method, 'POST')
+    task_payload = {
+        'app_engine_http_request': {
+            'http_method': method_str, 'relative_uri': add_req.url.decode('utf-8'),
+            'headers': {h.key.decode('utf-8'): h.value.decode('utf-8') for h in add_req.header}
+        }
+    }
+    if add_req.body: task_payload['app_engine_http_request']['body'] = base64.b64encode(add_req.body).decode('utf-8')
+    task = tasks_v2beta3.Task(**task_payload)
+    if add_req.eta_usec and add_req.eta_usec > 0:
+        task.schedule_time = datetime.datetime.utcfromtimestamp(float(add_req.eta_usec) / 1e6)
+    if add_req.task_name: task.name = '%s/tasks/%s' % (parent, add_req.task_name.decode('utf-8'))
+    return parent, task
+
+async def _CallCloudTasksAI(method, path, body=None, **kwargs):
+    """Internal helper to call the Cloud Tasks v2beta3 API asynchronously."""
+    if not google_auth_present:
+        raise TransientError("google-auth/google-cloud-tasks not installed.")
+
+    client = tasks_v2beta3.CloudTasksAsyncClient()
+    logging.info("Cloud Tasks Migration Path: Executing %s %s", method, path)
+
+    try:
+        if method == 'POST' and '/tasks' in path and not ':' in path:  # Create Task
+            parent = path.replace('/tasks', '')
+            task = body.get('task')
+            return await client.create_task(parent=parent, task=task)
+        elif method == 'DELETE' and '/tasks/' in path:  # Delete Task
+            return await client.delete_task(name=path)
+        elif method == 'POST' and ':purge' in path:  # Purge Queue
+            queue_name = path.replace(':purge', '')
+            return await client.purge_queue(name=queue_name)
+        elif method == 'GET' and '/queues/' in path:  # Get Queue
+            return await client.get_queue(name=path, **kwargs)
+        else:
+            raise NotImplementedError(f"Cloud Tasks method {method} for path {path} not implemented.")
+    except api_core_exceptions.NotFound as e:
+        logging.error("Cloud Tasks API Failure [NotFound: %s]: %s", path, e)
+        raise UnknownQueueError("Queue or Task not found: %s" % e)
+    except api_core_exceptions.AlreadyExists as e:
+        logging.error("Cloud Tasks API Failure [AlreadyExists: %s]: %s", path, e)
+        raise TaskAlreadyExistsError("Task already exists: %s" % e)
+    except api_core_exceptions.PermissionDenied as e:
+        logging.error("Cloud Tasks API Failure [PermissionDenied: %s]: %s", path, e)
+        raise PermissionDeniedError("Permission denied for Cloud Tasks: %s" % e)
+    except Exception as e:
+        logging.exception("Cloud Tasks API call failed for %s %s: %s", method, path, e)
+        raise TransientError(f"Cloud Tasks API call failed: {e}")
 
 
-
-
-
-
-
-
-
-
-
+def _ShouldUseCloudTasks():
+  """Helper to check if Cloud Tasks redirection should be used."""
+  return os.environ.get('GAE_USE_CLOUDTASKS_PATH') == 'true' and google
 
 
 __all__ = [
@@ -467,27 +537,244 @@ def _flatten_params(params):
   return param_list
 
 
+def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rpc=None, multiple=False):
+  """Internal helper to schedule an asynchronous RPC, redirected to Cloud Tasks where supported."""
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+  awaitable = None
+  hook = None
+
+  # 1. Single Task Add (Non-Transactional)
+  if method == 'BulkAdd' and len(request.add_request) == 1:
+    add_req = request.add_request[0]
+    if not add_req.HasField('transaction'):
+      logging.info("Cloud Tasks Migration: Routing single Task Add to Cloud Tasks.")
+      parent, task = _GetTaskForCloudTasks(add_req, project, location)
+      awaitable = _CallCloudTasksAI('POST', '%s/tasks' % parent, body={'task': task})
+      def bulk_add_hook(rpc, ct_result):
+        rpc.response.taskresult.add().result = 0 # OK
+        task = rpc._task # Single task passed to RPC
+        task._Task__enqueued = True
+        task._backend_used = 'Cloud Tasks'
+        return task
+      hook = bulk_add_hook
+
+  # 2. Single Task Delete
+  elif method == 'Delete' and len(request.task_name) == 1:
+    logging.info("Cloud Tasks Migration: Routing Task Delete to Cloud Tasks.")
+    task_name_str = request.task_name[0].decode('utf-8')
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s/tasks/%s' % (
+        project, location, queue_name_str, task_name_str)
+    awaitable = _CallCloudTasksAI('DELETE', path)
+    def delete_hook(rpc, ct_result):
+      rpc.response.result.append(0) # OK
+      return None
+    hook = delete_hook
+
+  # 3. Purge Queue
+  elif method == 'PurgeQueue':
+    logging.info("Cloud Tasks Migration: Routing PurgeQueue to Cloud Tasks.")
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s:purge' % (project, location, queue_name_str)
+    awaitable = _CallCloudTasksAI('POST', path)
+    def purge_hook(rpc, ct_result):
+      return None
+    hook = purge_hook
+
+  # 4. Fetch Queue Stats (Using GetQueue)
+  elif method == 'FetchQueueStats':
+    logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks GetQueue.")
+    q_names = request.queue_name
+    async def fetch_all_stats():
+      results = []
+      for q_name in q_names:
+        path = 'projects/%s/locations/%s/queues/%s' % (project, location, q_name.decode('utf-8'))
+        try:
+          # Request the 'stats' field which is expensive and excluded by default.
+          mask = field_mask_pb2.FieldMask(paths=['stats'])
+          ct_queue = await _CallCloudTasksAI('GET', path, read_mask=mask)
+          results.append(ct_queue)
+        except UnknownQueueError:
+          results.append(None) # Indicate not found
+        except Exception as e:
+          logging.error("Failed to fetch stats for %s: %s", q_name.decode('utf-8'), e)
+          results.append(e) # Pass error through
+      return results
+    awaitable = fetch_all_stats()
+    def stats_hook(rpc, ct_results, multiple=multiple):
+      for ct_queue in ct_results:
+        stats = rpc.response.queuestats.add()
+        if isinstance(ct_queue, tasks_v2beta3.Queue):
+          stats.num_tasks = ct_queue.stats.tasks_count if ct_queue.stats else 0
+          stats.oldest_eta_usec = -1 # Not directly available
+        elif ct_queue is None or isinstance(ct_queue, UnknownQueueError):
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+        else: # Error case
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+      # Original ResultHook for FetchQueueStats returns a list of QueueStatistics objects
+      queue_stats = []
+      for i, q_name in enumerate(rpc._q_names):
+          stats_pb = rpc.response.queuestats[i]
+          # Corrected keyword arg here
+          qs = QueueStatistics(tasks=stats_pb.num_tasks,
+                               oldest_eta_usec=stats_pb.oldest_eta_usec,
+                               queue=Queue(name=q_name.decode('utf-8')))
+          setattr(qs, '_backend_used', 'Cloud Tasks') # Add attribute after creation
+          queue_stats.append(qs)
+      return queue_stats[0] if not multiple and queue_stats else queue_stats
+    hook = stats_hook
+
+  if awaitable:
+    task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
+    q_names = request.queue_name if method == 'FetchQueueStats' else None
+    ct_rpc = CloudTasksRPC(awaitable, get_result_hook=hook, response_pb=response, task=task, q_names=q_names)
+    return True, ct_rpc
+  else:
+    # Should not be reached if called from the guards in public methods
+    raise NotImplementedError("Method not supported by Cloud Tasks path in _MakeCloudTasksAsyncCall")
+
+
+def _CallCloudTasksSyncBridge(method, request):
+  """Bridge for single, non-transactional sync calls to Cloud Tasks."""
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+
+  if method == 'BulkAdd' and len(request.add_request) == 1:
+    add_req = request.add_request[0]
+    parent, task = _GetTaskForCloudTasks(add_req, project, location)
+    try:
+      return asyncio.run(_CallCloudTasksAI('POST', '%s/tasks' % parent, body={'task': task}))
+    except Exception as e:
+      raise _TranslateError(e)
+  else:
+    raise NotImplementedError(f"Unsupported sync bridge method: {method}")
+
+def _CallCloudTasksSync(method, request, response):
+  """Internal helper to make synchronous calls to Cloud Tasks."""
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+
+  # 2. Single Task Delete - Not typically called synchronously in this way
+  # 3. Purge Queue
+  if method == 'PurgeQueue':
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s:purge' % (project, location, queue_name_str)
+    try:
+      asyncio.run(_CallCloudTasksAI('POST', path))
+      return True
+    except Exception as e:
+      raise _TranslateError(e)
+
+  # 4. Fetch Queue Stats
+  elif method == 'FetchQueueStats':
+    q_names = request.queue_name
+    try:
+      results = []
+      for q_name in q_names:
+        path = 'projects/%s/locations/%s/queues/%s' % (project, location, q_name.decode('utf-8'))
+        try:
+          ct_queue = asyncio.run(_CallCloudTasksAI('GET', path))
+          results.append(ct_queue)
+        except UnknownQueueError:
+          results.append(None)
+        except Exception as e:
+          logging.exception("Failed to fetch stats for %s: %s", q_name.decode('utf-8'), e)
+          results.append(e)
+
+      logging.info("Cloud Tasks Sync FetchQueueStats results: %s", results)
+
+      for i, ct_queue in enumerate(results):
+        logging.info("Processing result %d: type=%s, value=%s", i, type(ct_queue), ct_queue)
+
+      for ct_queue in results:
+        stats = response.queuestats.add()
+        if isinstance(ct_queue, tasks_v2beta3.Queue):
+          stats.num_tasks = ct_queue.stats.tasks_count if ct_queue.stats else 0
+          stats.oldest_eta_usec = -1
+        else:
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+      return True
+    except Exception as e:
+      raise _TranslateError(e)
+
+  return False
+
 def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
-  """Internal helper to schedule an asynchronous RPC.
-
-  Args:
-      method: The name of the taskqueue_service method that should be called,
-          for example: `BulkAdd`.
-      request: The protocol buffer that contains the request argument.
-      response: The protocol buffer to be populated with the response.
-      get_result_hook: An optional hook function used to process results. See
-          `UserRPC.make_call()` for more information.
-      rpc: An optional UserRPC object that will be used to make the call.
-
-  Returns:
-      A UserRPC object; either the object that was passed in as the RPC
-      argument, or a new object if no RPC was passed in.
-  """
+  """Schedules an asynchronous RPC via AppServer."""
+  backend_used = "Appserver"
+  logging.info("Cloud Tasks Migration: Using %s path for %s.", backend_used, method)
   if rpc is None:
     rpc = create_rpc()
-  assert rpc.service == 'taskqueue', repr(rpc.service)
+  rpc._backend_used = backend_used
   rpc.make_call(method, request, response, get_result_hook, None)
   return rpc
+
+
+def _CreateMockRPC(response, get_result_hook):
+  class MockRPC(object):
+    def __init__(self):
+      self._mock_response = response
+      self._get_result_hook = get_result_hook
+  return MockRPC()
+
+
+class _SimpleSyncRPC(object):
+    """A simple RPC-like object to wrap a synchronous result."""
+    def __init__(self, result):
+        self._result = result
+
+    def get_result(self):
+        return self._result
+
+class CloudTasksRPC(object):
+    """RPC-like object for wrapping Cloud Tasks async calls."""
+    def __init__(self, awaitable, get_result_hook=None, response_pb=None, task=None, q_names=None):
+        self._awaitable = awaitable
+        self._get_result_hook = get_result_hook
+        self._response_pb = response_pb  # Pre-populated response proto
+        self._backend_used = "Cloud Tasks"
+        self._result = None
+        self._exception = None
+        self._task = task # Single task for Add
+        self._q_names = q_names
+
+    @property
+    def response(self):
+            return self._response_pb
+
+    def wait(self):
+        """Blocks until the async operation is complete."""
+        self.get_result()
+
+    def check_success(self):
+        """Blocks and raises if the operation failed."""
+        self.wait()
+        if self._exception:
+            raise self._exception
+
+    def get_result(self):
+        """Blocks until completion and returns the result."""
+        if self._result is None and self._exception is None:
+            try:
+                ct_result = asyncio.run(self._awaitable)
+                if self._get_result_hook:
+                    # The hook is responsible for populating response_pb if needed
+                    # and returning the final result expected by the caller.
+                    self._result = self._get_result_hook(self, ct_result)
+                else:
+                    self._result = ct_result
+            except Exception as e:
+                self._exception = _TranslateError(e)
+        
+        if self._exception:
+            raise self._exception
+        return self._result
+
+
 
 
 def _TranslateError(error, detail=''):
@@ -824,6 +1111,7 @@ class Task(object):
     self.__retry_count = 0
     self.__queue_name = None
     self.__dispatch_deadline_usec = kwargs.get('dispatch_deadline_usec')
+    self._backend_used = None
 
 
     size_check = kwargs.get('_size_check', True)
@@ -1221,6 +1509,11 @@ class Task(object):
     return self.__method
 
   @property
+  def backend_used(self):
+    """Returns the backend API used to enqueue this task ('Cloud Tasks' or 'Appserver')."""
+    return self._backend_used
+
+  @property
   def name(self):
     """Returns the name of this task."""
     return self.__name
@@ -1558,37 +1851,17 @@ class QueueStatistics(object):
       return []
 
     rpc = create_rpc(deadline)
-    cls.fetch_async(queue_or_queues, rpc)
+    rpc = cls.fetch_async(queue_or_queues, rpc)
     return rpc.get_result()
 
   @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
 
-    def ResultHook(rpc):
-      """Processes the TaskQueueFetchQueueStatsResponse."""
-      try:
-        rpc.check_success()
-      except apiproxy_errors.ApplicationError as e:
-        raise _TranslateError(e.application_error, e.error_detail)
-
-      assert len(queues) == len(rpc.response.queuestats), (
-          'Expected %d results, got %d' %
-          (len(queues), len(rpc.response.queuestats_size)))
-      queue_stats = [cls._ConstructFromFetchQueueStatsResponse(queue, response)
-                     for queue, response in zip(queues,
-                                                rpc.response.queuestats)]
-      if multiple:
-        return queue_stats
-      else:
-        assert len(queue_stats) == 1
-        return queue_stats[0]
-
     request = taskqueue_service_pb2.TaskQueueFetchQueueStatsRequest()
     response = taskqueue_service_pb2.TaskQueueFetchQueueStatsResponse()
 
     requested_app_id = queues[0]._app
-
     for queue in queues:
       request.queue_name.append(six.ensure_binary(queue.name))
       if queue._app != requested_app_id:
@@ -1596,11 +1869,42 @@ class QueueStatistics(object):
     if requested_app_id:
       request.app_id = six.ensure_binary(requested_app_id)
 
-    return _MakeAsyncCall('FetchQueueStats',
-                          request,
-                          response,
-                          ResultHook,
-                          rpc)
+    if rpc is None: rpc = create_rpc()
+
+    if _ShouldUseCloudTasks():
+      # Async Cloud Tasks Path for FetchQueueStats
+      logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks Async path.")
+      handled, result_rpc = _MakeCloudTasksAsyncCall('FetchQueueStats', request, response, None, rpc, multiple=multiple)
+      if not handled:
+          raise TransientError("Failed to initiate FetchQueueStats via Cloud Tasks Async path.")
+      return result_rpc
+    else:
+      # Legacy path
+      def ResultHook(rpc):
+        """Processes the TaskQueueFetchQueueStatsResponse for Appserver path."""
+        try:
+          rpc.check_success()
+        except apiproxy_errors.ApplicationError as e:
+          raise _TranslateError(e.application_error, e.error_detail)
+
+        assert len(queues) == len(rpc.response.queuestats), (
+            'Expected %d results, got %d' % (
+             len(queues), len(rpc.response.queuestats)))
+
+        queue_stats = [QueueStatistics._FromPb(queue, rpc.response.queuestats[i])
+                       for i, queue in enumerate(queues)]
+
+        if multiple:
+          return queue_stats
+        else:
+          return queue_stats[0]
+
+      setattr(rpc, '_backend_used', 'Appserver')
+      return _MakeAsyncCall('FetchQueueStats',
+                            request,
+                            response,
+                            ResultHook,
+                            rpc)
 
 
 class Queue(object):
@@ -1661,13 +1965,25 @@ class Queue(object):
     if self._app:
       request.app_id = six.ensure_binary(self._app)
 
-    try:
-      apiproxy_stub_map.MakeSyncCall('taskqueue',
-                                     'PurgeQueue',
-                                     request,
-                                     response)
-    except apiproxy_errors.ApplicationError as e:
-      raise _TranslateError(e.application_error, e.error_detail)
+    if _ShouldUseCloudTasks():
+      logging.info("Cloud Tasks Migration: Routing PurgeQueue to Cloud Tasks (Sync).")
+      try:
+        if not _CallCloudTasksSync('PurgeQueue', request, response):
+          # This case should ideally not be reached if _ShouldUseCloudTasks is True
+          raise TransientError("Failed to execute PurgeQueue via Cloud Tasks Sync path.")
+      except Exception as e:
+        raise _TranslateError(e)
+    else:
+      # Legacy path
+      try:
+        apiproxy_stub_map.MakeSyncCall('taskqueue',
+                                       'PurgeQueue',
+                                       request,
+                                       response)
+      except apiproxy_errors.ApplicationError as e:
+        raise _TranslateError(e.application_error, e.error_detail)
+      except apiproxy_errors.Error as e:
+        raise _TranslateError(e)
 
   def delete_tasks_by_name_async(self, task_name, rpc=None):
     """Asynchronously deletes a task or list of tasks in this queue, by name.
@@ -1811,6 +2127,7 @@ class Queue(object):
         if result == taskqueue_service_pb2.TaskQueueServiceError.OK:
 
           task._Task__deleted = True
+          task._Task__backend_used = getattr(rpc, '_backend_used', 'Appserver')
         elif result in IGNORED_STATES:
 
           task._Task__deleted = False
@@ -1844,11 +2161,22 @@ class Queue(object):
       task_names.add(task.name)
       request.task_name.append(six.ensure_binary(task.name))
 
-    return _MakeAsyncCall('Delete',
-                          request,
-                          response,
-                          ResultHook,
-                          rpc)
+    if _ShouldUseCloudTasks():
+      # Currently only supports single task deletion
+      if len(request.task_name) == 1:
+        _, result_rpc = _MakeCloudTasksAsyncCall('Delete', request, response, None, rpc)
+        return result_rpc
+      else:
+        # Cloud Tasks path does not support batch delete yet, fall to legacy or raise?
+        # Per plan, errors should propagate, so raise an error if CT is selected but not supported.
+        raise NotImplementedError("Batch delete is not supported in Cloud Tasks path yet.")
+    else:
+      # Legacy path
+      return _MakeAsyncCall('Delete',
+                            request,
+                            response,
+                            ResultHook,
+                            rpc)
 
   @staticmethod
   def _ValidateLeaseSeconds(lease_seconds):
@@ -1892,10 +2220,15 @@ class Queue(object):
 
       tasks = []
       for response_task in rpc.response.task:
-        tasks.append(
-            Task._FromQueryAndOwnResponseTask(queue_name, response_task))
+        task = Task._FromQueryAndOwnResponseTask(queue_name, response_task)
+        task._Task__backend_used = getattr(rpc, '_backend_used', 'Appserver')
+        tasks.append(task)
       return tasks
 
+    if _ShouldUseCloudTasks():
+      handled, result_rpc = _MakeCloudTasksAsyncCall('QueryAndOwnTasks', request, response, ResultHook, rpc)
+      if handled:
+        return result_rpc
     return _MakeAsyncCall('QueryAndOwnTasks',
                           request,
                           response,
@@ -2233,6 +2566,7 @@ class Queue(object):
             task._Task__name = task_result.chosen_task_name.decode('utf8')
           task._Task__queue_name = self.__name
           task._Task__enqueued = True
+          task._backend_used = getattr(rpc, '_backend_used', 'Appserver')
         elif (task_result.result ==
               taskqueue_service_pb2.TaskQueueServiceError.SKIPPED):
           pass
@@ -2276,11 +2610,39 @@ class Queue(object):
           'Transactional request size must be less than %d; found %d' %
           (MAX_TRANSACTIONAL_REQUEST_SIZE_BYTES, request.ByteSize()))
 
-    return _MakeAsyncCall('BulkAdd',
-                          request,
-                          response,
-                          ResultHook,
-                          rpc)
+    use_cloud_tasks = _ShouldUseCloudTasks()
+    is_supported_by_ct = len(tasks) == 1 and not transactional
+
+    if use_cloud_tasks and is_supported_by_ct:
+      # Synchronous path for single, non-transactional task add with Cloud Tasks
+      logging.info("Cloud Tasks Migration: Routing single Task Add to Cloud Tasks (Sync Bridge).")
+      try:
+        ct_result = _CallCloudTasksSyncBridge('BulkAdd', request)
+        # Populate response based on ct_result
+        res = response.taskresult.add()
+        res.result = taskqueue_service_pb2.TaskQueueServiceError.OK
+        if ct_result.name:
+             # Extract the task name from the full resource name
+            res.chosen_task_name = ct_result.name.split('/')[-1].encode('utf8')
+        task = tasks[0]
+        task._Task__name = res.chosen_task_name.decode('utf8')
+        task._Task__queue_name = self.__name
+        task._Task__enqueued = True
+        task._backend_used = 'Cloud Tasks'
+        result = tasks[0] if not multiple else tasks
+        return _SimpleSyncRPC(result)
+      except Exception as e:
+        raise _TranslateError(e)
+    elif use_cloud_tasks and not is_supported_by_ct:
+      # Raise error if CT is selected but the task type is not supported
+      raise NotImplementedError("Only single, non-transactional tasks are supported in the Cloud Tasks path currently.")
+    else:
+      # Legacy path
+      return _MakeAsyncCall('BulkAdd',
+                            request,
+                            response,
+                            ResultHook,
+                            rpc)
 
   def __FillTaskQueueRetryParameters(self,
                                      retry_options,
@@ -2472,7 +2834,7 @@ class Queue(object):
     """
     _ValidateDeadline(deadline)
     rpc = create_rpc(deadline)
-    self.fetch_statistics_async(rpc)
+    rpc = self.fetch_statistics_async(rpc)
     return rpc.get_result()
 
   def __repr__(self):

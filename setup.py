@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="appengine-python-standard",
-    version="1.1.10",
+    version="1.1.13",
     author="Google LLC",
     description="Google App Engine services SDK for Python 3",
     long_description=long_description,
@@ -18,6 +18,7 @@ setuptools.setup(
         "attrs>=21.2.0",
         "frozendict>=1.2",
         "google-auth>=1.31.0",
+        "google-cloud-tasks>=2.0.0",
         "mock>=4.0.3",
         "Pillow>=8.3.1",
         "protobuf>=3.19.0",
