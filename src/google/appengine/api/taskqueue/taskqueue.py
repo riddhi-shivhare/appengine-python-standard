@@ -567,6 +567,58 @@ def _flatten_params(params):
 
   return param_list
 
+def _CallCloudTasksSyncBridge(method, request):
+  """Bridge for single, non-transactional sync calls to Cloud Tasks."""
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+
+  if method == 'BulkAdd' and len(request.add_request) == 1:
+    add_req = request.add_request[0]
+    parent, task = _GetTaskForCloudTasks(add_req, project, location)
+    try:
+      return asyncio.run(_CallCloudTasksAI('POST', '%s/tasks' % parent, body={'task': task}))
+    except Exception as e:
+      raise _TranslateError(e)
+  else:
+    raise NotImplementedError(f"Unsupported sync bridge method: {method}")
+
+def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rpc=None, multiple=False):
+  """Internal helper to schedule an asynchronous RPC, redirected to Cloud Tasks where supported.
+
+  Args:
+      method: The name of the taskqueue_service method that should be called,
+          for example: `BulkAdd`.
+      request: The protocol buffer that contains the request argument.
+      response: The protocol buffer to be populated with the response.
+      get_result_hook: An optional hook function used to process results. See
+          `UserRPC.make_call()` for more information.
+      rpc: An optional UserRPC object that will be used to make the call.
+      multiple: Whether the request is for multiple tasks (e.g. BulkAdd).
+
+  Returns:
+      A UserRPC object; either the object that was passed in as the RPC
+      argument, or a new object if no RPC was passed in.
+  """
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+  awaitable = None
+  hook = None
+
+  # 1. Single Task Add (Non-Transactional)
+  if method == 'BulkAdd' and len(request.add_request) == 1:
+    add_req = request.add_request[0]
+    if not add_req.HasField('transaction'):
+      logging.info("Cloud Tasks Migration: Routing single Task Add to Cloud Tasks.")
+      parent, task = _GetTaskForCloudTasks(add_req, project, location)
+      awaitable = _CallCloudTasksAI('POST', '%s/tasks' % parent, body={'task': task})
+      def bulk_add_hook(rpc, ct_result):
+        rpc.response.taskresult.add().result = 0 # OK
+        task = rpc._task # Single task passed to RPC
+        task._Task__enqueued = True
+        task._backend_used = 'Cloud Tasks'
+        return task
+      hook = bulk_add_hook
+  
 
 def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
   """Internal helper to schedule an asynchronous RPC.
@@ -2377,8 +2429,34 @@ class Queue(object):
       raise TransactionalRequestTooLargeError(
           'Transactional request size must be less than %d; found %d' %
           (MAX_TRANSACTIONAL_REQUEST_SIZE_BYTES, request.ByteSize()))
+    use_cloud_tasks = _ShouldUseCloudTasks()
+    is_supported_by_ct = len(tasks) == 1 and not transactional
 
-    return _MakeAsyncCall('BulkAdd',
+    if use_cloud_tasks and is_supported_by_ct:
+      # Synchronous path for single, non-transactional task add with Cloud Tasks
+      logging.info("Cloud Tasks Migration: Routing single Task Add to Cloud Tasks (Sync Bridge).")
+      try:
+        ct_result = _CallCloudTasksSyncBridge('BulkAdd', request)
+        # Populate response based on ct_result
+        res = response.taskresult.add()
+        res.result = taskqueue_service_pb2.TaskQueueServiceError.OK
+        if ct_result.name:
+             # Extract the task name from the full resource name
+            res.chosen_task_name = ct_result.name.split('/')[-1].encode('utf8')
+        task = tasks[0]
+        task._Task__name = res.chosen_task_name.decode('utf8')
+        task._Task__queue_name = self.__name
+        task._Task__enqueued = True
+        task._backend_used = 'Cloud Tasks'
+        result = tasks[0] if not multiple else tasks
+        return _SimpleSyncRPC(result)
+      except Exception as e:
+        raise _TranslateError(e)
+    elif use_cloud_tasks and not is_supported_by_ct:
+      # Raise error if CT is selected but the task type is not supported
+      raise NotImplementedError("Only single, non-transactional tasks are supported in the Cloud Tasks path currently.")
+    else:
+      return _MakeAsyncCall('BulkAdd',
                           request,
                           response,
                           ResultHook,
