@@ -1789,38 +1789,7 @@ class QueueStatistics(object):
     if requested_app_id:
       request.app_id = six.ensure_binary(requested_app_id)
 
-    if rpc is None: rpc = create_rpc()
-
-    if _ShouldUseCloudTasks():
-      # Async Cloud Tasks Path for FetchQueueStats
-      logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks Async path.")
-      handled, result_rpc = _MakeCloudTasksAsyncCall('FetchQueueStats', request, response, None, rpc, multiple=multiple)
-      if not handled:
-          raise TransientError("Failed to initiate FetchQueueStats via Cloud Tasks Async path.")
-      return result_rpc
-    else:
-      # Legacy path
-      def ResultHook(rpc):
-        """Processes the TaskQueueFetchQueueStatsResponse for Appserver path."""
-        try:
-          rpc.check_success()
-        except apiproxy_errors.ApplicationError as e:
-          raise _TranslateError(e.application_error, e.error_detail)
-
-        assert len(queues) == len(rpc.response.queuestats), (
-            'Expected %d results, got %d' % (
-             len(queues), len(rpc.response.queuestats)))
-
-        queue_stats = [QueueStatistics._FromPb(queue, rpc.response.queuestats[i])
-                       for i, queue in enumerate(queues)]
-
-        if multiple:
-          return queue_stats
-        else:
-          return queue_stats[0]
-
-      setattr(rpc, '_backend_used', 'Appserver')
-      return _MakeAsyncCall('FetchQueueStats',
+    return _MakeAsyncCall('FetchQueueStats',
                             request,
                             response,
                             ResultHook,
@@ -1885,13 +1854,25 @@ class Queue(object):
     if self._app:
       request.app_id = six.ensure_binary(self._app)
 
-    try:
-      apiproxy_stub_map.MakeSyncCall('taskqueue',
-                                     'PurgeQueue',
-                                     request,
-                                     response)
-    except apiproxy_errors.ApplicationError as e:
-      raise _TranslateError(e.application_error, e.error_detail)
+    if _ShouldUseCloudTasks():
+      logging.info("Cloud Tasks Migration: Routing PurgeQueue to Cloud Tasks (Sync).")
+      try:
+        if not _CallCloudTasksSync('PurgeQueue', request, response):
+          # This case should ideally not be reached if _ShouldUseCloudTasks is True
+          raise TransientError("Failed to execute PurgeQueue via Cloud Tasks Sync path.")
+      except Exception as e:
+        raise _TranslateError(e)
+    else:
+      # Legacy path
+      try:
+        apiproxy_stub_map.MakeSyncCall('taskqueue',
+                                       'PurgeQueue',
+                                       request,
+                                       response)
+      except apiproxy_errors.ApplicationError as e:
+        raise _TranslateError(e.application_error, e.error_detail)
+      except apiproxy_errors.Error as e:
+        raise _TranslateError(e)
 
   def delete_tasks_by_name_async(self, task_name, rpc=None):
     """Asynchronously deletes a task or list of tasks in this queue, by name.
