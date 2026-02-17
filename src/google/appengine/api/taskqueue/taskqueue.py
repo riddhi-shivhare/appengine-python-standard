@@ -618,7 +618,15 @@ def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rp
         task._backend_used = 'Cloud Tasks'
         return task
       hook = bulk_add_hook
-  
+
+    if awaitable:
+      task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
+      q_names = request.queue_name if method == 'FetchQueueStats' else None
+      ct_rpc = CloudTasksRPC(awaitable, get_result_hook=hook, response_pb=response, task=task, q_names=q_names)
+      return True, ct_rpc
+    else:
+      # Should not be reached if called from the guards in public methods
+      raise NotImplementedError("Method not supported by Cloud Tasks path in _MakeCloudTasksAsyncCall")
 
 def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
   """Internal helper to schedule an asynchronous RPC.
