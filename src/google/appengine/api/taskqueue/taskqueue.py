@@ -607,6 +607,39 @@ def _CallCloudTasksSync(method, request, response):
     except Exception as e:
       raise _TranslateError(e)
 
+  # Fetch Queue Stats
+  elif method == 'FetchQueueStats':
+    q_names = request.queue_name
+    try:
+      results = []
+      for q_name in q_names:
+        path = 'projects/%s/locations/%s/queues/%s' % (project, location, q_name.decode('utf-8'))
+        try:
+          ct_queue = asyncio.run(_CallCloudTasksAI('GET', path))
+          results.append(ct_queue)
+        except UnknownQueueError:
+          results.append(None)
+        except Exception as e:
+          logging.exception("Failed to fetch stats for %s: %s", q_name.decode('utf-8'), e)
+          results.append(e)
+
+      logging.info("Cloud Tasks Sync FetchQueueStats results: %s", results)
+
+      for i, ct_queue in enumerate(results):
+        logging.info("Processing result %d: type=%s, value=%s", i, type(ct_queue), ct_queue)
+
+      for ct_queue in results:
+        stats = response.queuestats.add()
+        if isinstance(ct_queue, tasks_v2beta3.Queue):
+          stats.num_tasks = ct_queue.stats.tasks_count if ct_queue.stats else 0
+          stats.oldest_eta_usec = -1
+        else:
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+      return True
+    except Exception as e:
+      raise _TranslateError(e)
+
   return False
 
 def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rpc=None, multiple=False):
@@ -668,6 +701,49 @@ def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rp
     def purge_hook(rpc, ct_result):
       return None
     hook = purge_hook
+  
+  # 4. Fetch Queue Stats (Using GetQueue)
+  elif method == 'FetchQueueStats':
+    logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks GetQueue.")
+    q_names = request.queue_name
+    async def fetch_all_stats():
+      results = []
+      for q_name in q_names:
+        path = 'projects/%s/locations/%s/queues/%s' % (project, location, q_name.decode('utf-8'))
+        try:
+          mask = field_mask_pb2.FieldMask(paths=['stats'])
+          ct_queue = await _CallCloudTasksAI('GET', path, read_mask=mask)
+          results.append(ct_queue)
+        except UnknownQueueError:
+          results.append(None) # Indicate not found
+        except Exception as e:
+          logging.error("Failed to fetch stats for %s: %s", q_name.decode('utf-8'), e)
+          results.append(e) # Pass error through
+      return results
+    awaitable = fetch_all_stats()
+    def stats_hook(rpc, ct_results, multiple=multiple):
+      for ct_queue in ct_results:
+        stats = rpc.response.queuestats.add()
+        if isinstance(ct_queue, tasks_v2beta3.Queue):
+          stats.num_tasks = ct_queue.stats.tasks_count if ct_queue.stats else 0
+          stats.oldest_eta_usec = -1 # Not directly available
+        elif ct_queue is None or isinstance(ct_queue, UnknownQueueError):
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+        else: # Error case
+          stats.num_tasks = 0
+          stats.oldest_eta_usec = -1
+      # Original ResultHook for FetchQueueStats returns a list of QueueStatistics objects
+      queue_stats = []
+      for i, q_name in enumerate(rpc._q_names):
+          stats_pb = rpc.response.queuestats[i]
+          qs = QueueStatistics(tasks=stats_pb.num_tasks,
+                               oldest_eta_usec=stats_pb.oldest_eta_usec,
+                               queue=Queue(name=q_name.decode('utf-8')))
+          setattr(qs, '_backend_used', 'Cloud Tasks') # Add attribute after creation
+          queue_stats.append(qs)
+      return queue_stats[0] if not multiple and queue_stats else queue_stats
+    hook = stats_hook
 
   if awaitable:
     task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
@@ -1789,7 +1865,38 @@ class QueueStatistics(object):
     if requested_app_id:
       request.app_id = six.ensure_binary(requested_app_id)
 
-    return _MakeAsyncCall('FetchQueueStats',
+    if rpc is None: rpc = create_rpc()
+
+    if _ShouldUseCloudTasks():
+      # Async Cloud Tasks Path for FetchQueueStats
+      logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks Async path.")
+      handled, result_rpc = _MakeCloudTasksAsyncCall('FetchQueueStats', request, response, None, rpc, multiple=multiple)
+      if not handled:
+          raise TransientError("Failed to initiate FetchQueueStats via Cloud Tasks Async path.")
+      return result_rpc
+    else:
+      # Legacy path
+      def ResultHook(rpc):
+        """Processes the TaskQueueFetchQueueStatsResponse for Appserver path."""
+        try:
+          rpc.check_success()
+        except apiproxy_errors.ApplicationError as e:
+          raise _TranslateError(e.application_error, e.error_detail)
+
+        assert len(queues) == len(rpc.response.queuestats), (
+            'Expected %d results, got %d' % (
+             len(queues), len(rpc.response.queuestats)))
+
+        queue_stats = [QueueStatistics._FromPb(queue, rpc.response.queuestats[i])
+                       for i, queue in enumerate(queues)]
+
+        if multiple:
+          return queue_stats
+        else:
+          return queue_stats[0]
+
+      setattr(rpc, '_backend_used', 'Appserver')
+      return _MakeAsyncCall('FetchQueueStats',
                             request,
                             response,
                             ResultHook,
