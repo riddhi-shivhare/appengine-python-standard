@@ -582,6 +582,33 @@ def _CallCloudTasksSyncBridge(method, request):
   else:
     raise NotImplementedError(f"Unsupported sync bridge method: {method}")
 
+def _CallCloudTasksSync(method, request, response):
+  """Internal helper to make synchronous calls to Cloud Tasks.
+
+  Args:
+      method: The name of the taskqueue_service method that should be called,
+          for example: `PurgeQueue`.
+      request: The protocol buffer that contains the request argument.
+      response: The protocol buffer to be populated with the response.
+
+  Returns:
+      A boolean indicating whether the call was successful.
+  """
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+
+  # Purge Queue
+  if method == 'PurgeQueue':
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s:purge' % (project, location, queue_name_str)
+    try:
+      asyncio.run(_CallCloudTasksAI('POST', path))
+      return True
+    except Exception as e:
+      raise _TranslateError(e)
+
+  return False
+
 def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rpc=None, multiple=False):
   """Internal helper to schedule an asynchronous RPC, redirected to Cloud Tasks where supported.
 
@@ -631,6 +658,16 @@ def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rp
       rpc.response.result.append(0) # OK
       return None
     hook = delete_hook
+  
+  # 3. Purge Queue
+  elif method == 'PurgeQueue':
+    logging.info("Cloud Tasks Migration: Routing PurgeQueue to Cloud Tasks.")
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s:purge' % (project, location, queue_name_str)
+    awaitable = _CallCloudTasksAI('POST', path)
+    def purge_hook(rpc, ct_result):
+      return None
+    hook = purge_hook
 
   if awaitable:
     task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
@@ -1740,25 +1777,6 @@ class QueueStatistics(object):
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
 
-    def ResultHook(rpc):
-      """Processes the TaskQueueFetchQueueStatsResponse."""
-      try:
-        rpc.check_success()
-      except apiproxy_errors.ApplicationError as e:
-        raise _TranslateError(e.application_error, e.error_detail)
-
-      assert len(queues) == len(rpc.response.queuestats), (
-          'Expected %d results, got %d' %
-          (len(queues), len(rpc.response.queuestats_size)))
-      queue_stats = [cls._ConstructFromFetchQueueStatsResponse(queue, response)
-                     for queue, response in zip(queues,
-                                                rpc.response.queuestats)]
-      if multiple:
-        return queue_stats
-      else:
-        assert len(queue_stats) == 1
-        return queue_stats[0]
-
     request = taskqueue_service_pb2.TaskQueueFetchQueueStatsRequest()
     response = taskqueue_service_pb2.TaskQueueFetchQueueStatsResponse()
 
@@ -1771,11 +1789,42 @@ class QueueStatistics(object):
     if requested_app_id:
       request.app_id = six.ensure_binary(requested_app_id)
 
-    return _MakeAsyncCall('FetchQueueStats',
-                          request,
-                          response,
-                          ResultHook,
-                          rpc)
+    if rpc is None: rpc = create_rpc()
+
+    if _ShouldUseCloudTasks():
+      # Async Cloud Tasks Path for FetchQueueStats
+      logging.info("Cloud Tasks Migration: Routing FetchQueueStats to Cloud Tasks Async path.")
+      handled, result_rpc = _MakeCloudTasksAsyncCall('FetchQueueStats', request, response, None, rpc, multiple=multiple)
+      if not handled:
+          raise TransientError("Failed to initiate FetchQueueStats via Cloud Tasks Async path.")
+      return result_rpc
+    else:
+      # Legacy path
+      def ResultHook(rpc):
+        """Processes the TaskQueueFetchQueueStatsResponse for Appserver path."""
+        try:
+          rpc.check_success()
+        except apiproxy_errors.ApplicationError as e:
+          raise _TranslateError(e.application_error, e.error_detail)
+
+        assert len(queues) == len(rpc.response.queuestats), (
+            'Expected %d results, got %d' % (
+             len(queues), len(rpc.response.queuestats)))
+
+        queue_stats = [QueueStatistics._FromPb(queue, rpc.response.queuestats[i])
+                       for i, queue in enumerate(queues)]
+
+        if multiple:
+          return queue_stats
+        else:
+          return queue_stats[0]
+
+      setattr(rpc, '_backend_used', 'Appserver')
+      return _MakeAsyncCall('FetchQueueStats',
+                            request,
+                            response,
+                            ResultHook,
+                            rpc)
 
 
 class Queue(object):
