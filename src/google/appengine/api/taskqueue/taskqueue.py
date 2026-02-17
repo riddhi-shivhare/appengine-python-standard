@@ -569,7 +569,7 @@ def _flatten_params(params):
 
 
 def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
-  """Internal helper to schedule an asynchronous RPC.
+  """Schedules an asynchronous RPC via AppServer.
 
   Args:
       method: The name of the taskqueue_service method that should be called,
@@ -584,8 +584,11 @@ def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
       A UserRPC object; either the object that was passed in as the RPC
       argument, or a new object if no RPC was passed in.
   """
+  backend_used = "Appserver"
+  logging.info("Cloud Tasks Migration: Using %s path for %s.", backend_used, method)
   if rpc is None:
     rpc = create_rpc()
+  rpc._backend_used = backend_used
   assert rpc.service == 'taskqueue', repr(rpc.service)
   rpc.make_call(method, request, response, get_result_hook, None)
   return rpc
@@ -1321,6 +1324,11 @@ class Task(object):
   def method(self):
     """Returns the method to use for this task."""
     return self.__method
+
+  @property
+  def backend_used(self):
+    """Returns the backend API used to enqueue this task ('Cloud Tasks' or 'Appserver')."""
+    return self._backend_used
 
   @property
   def name(self):
