@@ -618,13 +618,26 @@ def _MakeCloudTasksAsyncCall(method, request, response, get_result_hook=None, rp
         task._backend_used = 'Cloud Tasks'
         return task
       hook = bulk_add_hook
+    
+  # 2. Single Task Delete
+  elif method == 'Delete' and len(request.task_name) == 1:
+    logging.info("Cloud Tasks Migration: Routing Task Delete to Cloud Tasks.")
+    task_name_str = request.task_name[0].decode('utf-8')
+    queue_name_str = request.queue_name.decode('utf-8')
+    path = 'projects/%s/locations/%s/queues/%s/tasks/%s' % (
+          project, location, queue_name_str, task_name_str)
+    awaitable = _CallCloudTasksAI('DELETE', path)
+    def delete_hook(rpc, ct_result):
+      rpc.response.result.append(0) # OK
+      return None
+    hook = delete_hook
 
-    if awaitable:
-      task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
-      q_names = request.queue_name if method == 'FetchQueueStats' else None
-      ct_rpc = CloudTasksRPC(awaitable, get_result_hook=hook, response_pb=response, task=task, q_names=q_names)
-      return True, ct_rpc
-    else:
+  if awaitable:
+    task = rpc._task if method == 'BulkAdd' else None # Get from the passed in rpc object
+    q_names = request.queue_name if method == 'FetchQueueStats' else None
+    ct_rpc = CloudTasksRPC(awaitable, get_result_hook=hook, response_pb=response, task=task, q_names=q_names)
+    return True, ct_rpc
+  else:
       # Should not be reached if called from the guards in public methods
       raise NotImplementedError("Method not supported by Cloud Tasks path in _MakeCloudTasksAsyncCall")
 
@@ -2006,11 +2019,21 @@ class Queue(object):
       task_names.add(task.name)
       request.task_name.append(six.ensure_binary(task.name))
 
-    return _MakeAsyncCall('Delete',
-                          request,
-                          response,
-                          ResultHook,
-                          rpc)
+    if _ShouldUseCloudTasks():
+      # Currently only supports single task deletion
+      if len(request.task_name) == 1:
+        _, result_rpc = _MakeCloudTasksAsyncCall('Delete', request, response, None, rpc)
+        return result_rpc
+      else:
+        # Cloud Tasks path does not support batch delete yet.
+        raise NotImplementedError("Batch delete is not supported in Cloud Tasks path yet.")
+    else:
+      # Legacy path
+      return _MakeAsyncCall('Delete',
+                            request,
+                            response,
+                            ResultHook,
+                            rpc)
 
   @staticmethod
   def _ValidateLeaseSeconds(lease_seconds):
