@@ -31,8 +31,10 @@ can be used, which will translate task names into URLs relative to a queue's
 base path. A default queue is also provided for simple usage.
 """
 
+import base64
 import calendar
 import datetime
+import json
 import logging
 import math
 import os
@@ -50,15 +52,114 @@ from google.appengine.runtime import context
 import six
 from six.moves import urllib
 import six.moves.urllib.parse
+try:
+    import urllib.request as urllib_request
+    import urllib.error as urllib_error
+except ImportError:
+    import urllib2 as urllib_request
+    import urllib2 as urllib_error
+
+# New imports for Cloud Tasks migration
+try:
+    import google.auth
+    from google.auth.transport.requests import Request as AuthRequest
+    import urllib.request as urllib_req
+    from google.cloud import tasks_v2beta3
+    from google.api_core import exceptions as api_core_exceptions
+    from google.protobuf import field_mask_pb2
+    import asyncio
+    google_auth_present = True
+except ImportError:
+    google = None
+    google_auth_present = False
+    logging.warning("google-auth or google-cloud-tasks not found. Cloud Tasks redirection will not work.")
 
 
 
+def _ShouldUseCloudTasks():
+  """Helper to check if Cloud Tasks redirection should be used."""
+  return os.environ.get('GAE_USE_CLOUDTASKS_PATH') == 'true' and google
 
+async def _CallCloudTasksAI(method, path, body=None, **kwargs):
+    """Internal helper to call the Cloud Tasks v2beta3 API asynchronously.
+    
+    Args:
+        method: HTTP method (e.g., 'POST', 'DELETE').
+        path: Full API path (e.g., 'projects/.../locations/.../queues/.../tasks/...').
+        body: Request body dictionary.
+        **kwargs: Additional keyword arguments.
+        
+    Returns:
+        Response from the Cloud Tasks API.
+        
+    Raises:
+        TransientError: If google-auth or google-cloud-tasks is not installed.
+        UnknownQueueError: If the queue or task is not found.
+        PermissionDeniedError: If permission is denied.
+        TaskAlreadyExistsError: If the task already exists.
+        NotImplementedError: If the method/path combination is not implemented.
+        Exception: For other API call failures.
+    """
+    if not google_auth_present:
+        raise TransientError("google-auth/google-cloud-tasks not installed.")
 
+    client = tasks_v2beta3.CloudTasksAsyncClient()
+    logging.info("Cloud Tasks Migration Path: Executing %s %s", method, path)
 
+    try:
+        if method == 'POST' and '/tasks' in path and not ':' in path:  # Create Task
+            parent = path.replace('/tasks', '')
+            task = body.get('task')
+            return await client.create_task(parent=parent, task=task)
+        elif method == 'DELETE' and '/tasks/' in path:  # Delete Task
+            return await client.delete_task(name=path)
+        elif method == 'POST' and ':purge' in path:  # Purge Queue
+            queue_name = path.replace(':purge', '')
+            return await client.purge_queue(name=queue_name)
+        elif method == 'GET' and '/queues/' in path:  # Get Queue
+            return await client.get_queue(name=path, **kwargs)
+        else:
+            raise NotImplementedError(f"Cloud Tasks method {method} for path {path} not implemented.")
+    except api_core_exceptions.NotFound as e:
+        logging.error("Cloud Tasks API Failure [NotFound: %s]: %s", path, e)
+        raise UnknownQueueError("Queue or Task not found: %s" % e)
+    except api_core_exceptions.AlreadyExists as e:
+        logging.error("Cloud Tasks API Failure [AlreadyExists: %s]: %s", path, e)
+        raise TaskAlreadyExistsError("Task already exists: %s" % e)
+    except api_core_exceptions.PermissionDenied as e:
+        logging.error("Cloud Tasks API Failure [PermissionDenied: %s]: %s", path, e)
+        raise PermissionDeniedError("Permission denied for Cloud Tasks: %s" % e)
+    except Exception as e:
+        logging.exception("Cloud Tasks API call failed for %s %s: %s", method, path, e)
+        raise TransientError(f"Cloud Tasks API call failed: {e}")
 
+def _GetTaskForCloudTasks(add_req, project, location):
+    """Convert AddRequest to Cloud Tasks Task format.
 
-
+    Args:
+        add_req: AddRequest protobuf.
+        project: Google Cloud project ID.
+        location: Google Cloud location.
+        
+    Returns:
+        Tuple of (parent, task) for Cloud Tasks API.
+    """
+    queue_name_str = add_req.queue_name.decode('utf-8')
+    parent = 'projects/%s/locations/%s/queues/%s' % (project, location, queue_name_str)
+    _METHOD_MAP_INT_TO_STR = {1: 'GET', 2: 'POST', 3: 'HEAD', 4: 'PUT', 5: 'DELETE'}
+    method_str = _METHOD_MAP_INT_TO_STR.get(add_req.method, 'POST')
+    task_payload = {
+        'app_engine_http_request': {
+            'http_method': method_str, 'relative_uri': add_req.url.decode('utf-8'),
+            'headers': {h.key.decode('utf-8'): h.value.decode('utf-8') for h in add_req.header}
+        }
+    }
+    if add_req.body: task_payload['app_engine_http_request']['body'] = base64.b64encode(add_req.body).decode('utf-8')
+    task = tasks_v2beta3.Task(**task_payload)
+    if add_req.eta_usec and add_req.eta_usec > 0:
+        task.schedule_time = datetime.datetime.utcfromtimestamp(float(add_req.eta_usec) / 1e6)
+    if add_req.task_name: task.name = '%s/tasks/%s' % (parent, add_req.task_name.decode('utf-8'))
+    return parent, task
 
 
 
@@ -824,6 +925,7 @@ class Task(object):
     self.__retry_count = 0
     self.__queue_name = None
     self.__dispatch_deadline_usec = kwargs.get('dispatch_deadline_usec')
+    self._backend_used = None
 
 
     size_check = kwargs.get('_size_check', True)
