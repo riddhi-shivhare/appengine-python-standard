@@ -64,7 +64,7 @@ try:
     import google.auth
     from google.auth.transport.requests import Request as AuthRequest
     import urllib.request as urllib_req
-    from google.cloud import tasks_v2beta3
+    from google.cloud import tasks_v2beta2
     from google.api_core import exceptions as api_core_exceptions
     from google.protobuf import field_mask_pb2
     import asyncio
@@ -81,7 +81,7 @@ def _ShouldUseCloudTasks():
   return os.environ.get('GAE_USE_CLOUDTASKS_PATH') == 'true' and google
 
 async def _CallCloudTasksAI(method, path, body=None, **kwargs):
-    """Internal helper to call the Cloud Tasks v2beta3 API asynchronously.
+    """Internal helper to call the Cloud Tasks v2beta2 API asynchronously.
     
     Args:
         method: HTTP method (e.g., 'POST', 'DELETE').
@@ -103,7 +103,7 @@ async def _CallCloudTasksAI(method, path, body=None, **kwargs):
     if not google_auth_present:
         raise TransientError("google-auth/google-cloud-tasks not installed.")
 
-    client = tasks_v2beta3.CloudTasksAsyncClient()
+    client = tasks_v2beta2.CloudTasksAsyncClient()
     logging.info("Cloud Tasks Migration Path: Executing %s %s", method, path)
 
     try:
@@ -155,7 +155,7 @@ def _GetTaskForCloudTasks(add_req, project, location):
         }
     }
     if add_req.body: task_payload['app_engine_http_request']['body'] = base64.b64encode(add_req.body).decode('utf-8')
-    task = tasks_v2beta3.Task(**task_payload)
+    task = tasks_v2beta2.Task(**task_payload)
     if add_req.eta_usec and add_req.eta_usec > 0:
         task.schedule_time = datetime.datetime.utcfromtimestamp(float(add_req.eta_usec) / 1e6)
     if add_req.task_name: task.name = '%s/tasks/%s' % (parent, add_req.task_name.decode('utf-8'))
