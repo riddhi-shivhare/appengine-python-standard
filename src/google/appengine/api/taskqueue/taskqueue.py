@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+
 """Task Queue API.
 
 Enables an application to queue background work for itself. Work is done through
@@ -51,6 +52,18 @@ import six
 from six.moves import urllib
 import six.moves.urllib.parse
 
+
+
+
+
+
+
+
+
+
+
+
+
 try:
   from google.cloud import tasks_v2beta2
   from google.api_core import exceptions as api_core_exceptions
@@ -66,6 +79,17 @@ except ImportError:
 
 _CT_SYNC_CLIENT = None
 
+_GAE_PUSHQUEUE_BACKEND_ENV = 'GAE_PUSHQUEUE_BACKEND'
+_CLOUD_TASK_BACKEND = 'CLOUD_TASK'
+_LEGACY_BACKEND = 'LEGACY'
+
+_GOOGLE_CLOUD_PROJECT_ENV = 'GOOGLE_CLOUD_PROJECT'
+_CLOUD_TASKS_LOCATION_ENV = 'CLOUD_TASKS_LOCATION'
+
+_QUEUE_PATH_TEMPLATE = 'projects/%s/locations/%s/queues/%s'
+_QUEUE_PURGE_PATH_TEMPLATE = 'projects/%s/locations/%s/queues/%s:purge'
+_TASK_PATH_TEMPLATE = 'projects/%s/locations/%s/queues/%s/tasks/%s'
+
 def _get_ct_sync_client():
   global _CT_SYNC_CLIENT
   if _CT_SYNC_CLIENT is None:
@@ -74,7 +98,20 @@ def _get_ct_sync_client():
 
 def _ShouldUseCloudTasks():
   """Helper to check if Cloud Tasks redirection should be used."""
-  return os.environ.get('GAE_USE_CLOUDTASKS_PATH') == 'true' and google_auth_present
+  backend = os.environ.get(_GAE_PUSHQUEUE_BACKEND_ENV, _LEGACY_BACKEND)
+
+  if not backend:
+    backend = _LEGACY_BACKEND
+  if backend == _CLOUD_TASK_BACKEND:
+    if not google_auth_present:
+      logging.warning(
+          "GAE_PUSHQUEUE_BACKEND is set to CLOUD_TASK but google-auth or "
+          "google-cloud-tasks is not found. Falling back to LEGACY."
+      )
+      return False
+    return True
+  return False
+
 
 # Variable indicating which backend path is currently active
 backend_used = "Cloud Tasks" if _ShouldUseCloudTasks() else "Legacy TaskQueue"
@@ -105,7 +142,7 @@ def _GetTaskForCloudTasks(add_req, project, location):
     A tuple containing the parent resource name and the Cloud Tasks Task.
   """
   queue_name_str = add_req.queue_name.decode('utf-8') if isinstance(add_req.queue_name, bytes) else add_req.queue_name
-  parent = 'projects/%s/locations/%s/queues/%s' % (project, location, queue_name_str)
+  parent = _QUEUE_PATH_TEMPLATE % (project, location, queue_name_str)
   
   _METHOD_MAP_INT_TO_STR = {1: 'GET', 2: 'POST', 3: 'HEAD', 4: 'PUT', 5: 'DELETE'}
   method_str = _METHOD_MAP_INT_TO_STR.get(add_req.method, 'POST')
@@ -492,6 +529,7 @@ _ERROR_MAPPING = {
 }
 
 
+
 class _UTCTimeZone(datetime.tzinfo):
   """UTC time zone."""
 
@@ -561,6 +599,10 @@ def _flatten_params(params):
     elif isinstance(value, six.binary_type):
       return value
     else:
+
+
+
+
       return six.ensure_binary(str(value))
 
   param_list = []
@@ -833,14 +875,17 @@ class Task(object):
   be inserted into one queue only.
   """
 
+
   __CONSTRUCTOR_KWARGS = frozenset([
       'countdown', 'eta', 'headers', 'method', 'name', 'params',
       'retry_options', 'tag', 'target', 'url', '_size_check',
       'dispatch_deadline_usec'
   ])
 
+
   __eta_posix = None
   __target = None
+
 
   def __init__(self, payload=None, **kwargs):
     """Initializer.
@@ -934,8 +979,10 @@ class Task(object):
     self.__queue_name = None
     self.__dispatch_deadline_usec = kwargs.get('dispatch_deadline_usec')
 
+
     size_check = kwargs.get('_size_check', True)
     params = kwargs.get('params', {})
+
 
     apps_namespace = namespace_manager.google_apps_namespace()
     if apps_namespace is not None:
@@ -1037,6 +1084,10 @@ class Task(object):
       InvalidTaskError: If the task is invalid.
     """
 
+
+
+
+
     if context.get('HTTP_HOST', None) is None:
       logging.warning(
           'The HTTP_HOST environment variable was not set, but is required '
@@ -1050,6 +1101,8 @@ class Task(object):
     elif self.__target is not None:
       host = self.__host_from_target(self.__target)
       if host:
+
+
         self.__headers['Host'] = host
     elif 'Host' in self.__headers:
       self.__target = self.__target_from_host(self.__headers['Host'])
@@ -1058,6 +1111,8 @@ class Task(object):
         self.__headers['Host'] = context.get('HTTP_HOST')
         self.__target = self.__target_from_host(self.__headers['Host'])
       else:
+
+
         self.__target = _UNKNOWN_APP_VERSION
 
   @staticmethod
@@ -1077,12 +1132,20 @@ class Task(object):
     """
     default_hostname = app_identity.get_default_version_hostname()
     if default_hostname is None:
+
+
+
       return _UNKNOWN_APP_VERSION
 
     if host.endswith(default_hostname):
+
       version_name = host[:-(len(default_hostname) + 1)]
       if version_name:
         return version_name
+
+
+
+
 
     return DEFAULT_APP_VERSION
 
@@ -1100,6 +1163,9 @@ class Task(object):
     """
     default_hostname = app_identity.get_default_version_hostname()
     if default_hostname is None:
+
+
+
       return None
 
     server_software = os.environ.get('SERVER_SOFTWARE', '')
@@ -1107,6 +1173,7 @@ class Task(object):
       return default_hostname
     elif server_software.startswith(
         'Dev') and server_software != 'Development/1.0 (testbed)':
+
       target_components = target.rsplit('.', 3)
       module = target_components[-1]
       version = len(target_components) > 1 and target_components[-2] or None
@@ -1115,6 +1182,8 @@ class Task(object):
         return modules.get_hostname(module=module, version=version,
                                     instance=instance)
       except modules.InvalidModuleError as e:
+
+
         if not version:
           return modules.get_hostname(module='default', version=module,
                                       instance=instance)
@@ -1186,8 +1255,10 @@ class Task(object):
       if not isinstance(eta, datetime.datetime):
         raise InvalidTaskError('ETA must be a datetime.datetime instance')
       elif eta.tzinfo is None:
+
         return time.mktime(eta.timetuple()) + eta.microsecond*1e-6
       else:
+
         return calendar.timegm(eta.utctimetuple()) + eta.microsecond*1e-6
     elif countdown is not None:
       try:
@@ -1250,6 +1321,9 @@ class Task(object):
       kwargs['tag'] = six.ensure_text(response_task.tag)
     self = cls(**kwargs)
 
+
+
+
     self.__eta_posix = response_task.eta_usec * 1e-6
     self.__retry_count = response_task.retry_count
 
@@ -1266,6 +1340,7 @@ class Task(object):
   def eta_posix(self):
     """Returns a POSIX timestamp of when this task will run or be leased."""
     if self.__eta_posix is None and self.__eta is not None:
+
       self.__eta_posix = Task.__determine_eta_posix(self.__eta)
     return self.__eta_posix
 
@@ -1279,6 +1354,14 @@ class Task(object):
   @property
   def _eta_usec(self):
     """Returns a int microseconds timestamp when this task will run."""
+
+
+
+
+
+
+
+
     return int(round(self.eta_posix * 1e6))
 
   @property
@@ -1386,6 +1469,7 @@ class Task(object):
           tasks) or the URL does not contain a valid query (all other requests).
     """
     if self.__method in ('PULL', 'POST'):
+
       query = self.__payload
     else:
       query = six.moves.urllib.parse.urlparse(self.__relative_url).query
@@ -1560,6 +1644,7 @@ class QueueStatistics(object):
     """
     wants_list = True
 
+
     if isinstance(queue_or_queues, six.string_types):
       queue_or_queues = [queue_or_queues]
       wants_list = False
@@ -1623,6 +1708,7 @@ class QueueStatistics(object):
     _ValidateDeadline(deadline)
 
     if not queue_or_queues:
+
       return []
 
     rpc = create_rpc(deadline)
@@ -1630,55 +1716,70 @@ class QueueStatistics(object):
     return rpc.get_result()
 
   @classmethod
+  def _FetchMultipleQueuesCloudTasks(cls, queues, multiple, rpc=None):
+    """Internal implementation of fetch stats where queues must be a list using Cloud Tasks.
+  Args:
+      queues: A list of Queue objects to fetch statistics for.
+      multiple: Boolean indicating whether to return a list or a single result.
+      rpc: An optional UserRPC object.
+    """
+    project = os.environ.get(_GOOGLE_CLOUD_PROJECT_ENV)
+    location = os.environ.get(_CLOUD_TASKS_LOCATION_ENV, 'us-central1')
+    results = []
+    for queue in queues:
+      path = _QUEUE_PATH_TEMPLATE % (project, location, queue.name)
+      try:
+        # Request the stats field mask
+        mask = field_mask_pb2.FieldMask(paths=['stats'])
+        ct_queue = _execute_ct_sync_call('GET', path, read_mask=mask)
+        
+        if ct_queue.stats:
+          # Convert oldest_estimated_arrival_time (datetime) to microseconds
+          oldest_eta_usec = -1
+          if ct_queue.stats.oldest_estimated_arrival_time:
+              # timestamp() gives seconds as a float, multiply by 1e6 for usec
+              oldest_eta_usec = int(ct_queue.stats.oldest_estimated_arrival_time.timestamp() * 1e6)
+              
+          stats = QueueStatistics(
+              queue=queue,
+              tasks=ct_queue.stats.tasks_count,
+              oldest_eta_usec=oldest_eta_usec,
+              executed_last_minute=ct_queue.stats.executed_last_minute_count,
+              in_flight=ct_queue.stats.concurrent_dispatches_count,
+              enforced_rate=ct_queue.stats.effective_execution_rate
+          )
+        else:
+          # Fallback if the queue has no stats populated
+          stats = QueueStatistics(queue=queue, tasks=0, oldest_eta_usec=-1)
+          
+      except UnknownQueueError:
+        stats = QueueStatistics(queue=queue, tasks=0, oldest_eta_usec=-1)
+      except Exception as e:
+        raise TransientError("Failed to fetch stats: %s" % e)
+      stats._backend_used = 'Cloud Tasks'
+      results.append(stats)
+      
+    res = results if multiple else results[0]
+    
+    if rpc is not None:
+      # Patch the UserRPC object so its get_result returns our CT stats
+      rpc.get_result = lambda: res
+      rpc.check_success = lambda: None
+      rpc.wait = lambda: None
+      return rpc
+    return _SimpleSyncRPC(res)
+
+  @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
-    """Internal implementation of fetch stats where queues must be a list."""
+    """Internal implementation of fetch stats where queues must be a list.
+    Args:
+      queues: A list of Queue objects to fetch statistics for.
+      multiple: Boolean indicating whether to return a list or a single result.
+      rpc: An optional UserRPC object.
+    """
 
     if _ShouldUseCloudTasks():
-      project = os.environ.get('GOOGLE_CLOUD_PROJECT')
-      location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
-      results = []
-      for queue in queues:
-        path = 'projects/%s/locations/%s/queues/%s' % (project, location, queue.name)
-        try:
-          # Request the stats field mask
-          mask = field_mask_pb2.FieldMask(paths=['stats'])
-          ct_queue = _execute_ct_sync_call('GET', path, read_mask=mask)
-          
-          if ct_queue.stats:
-            # Convert oldest_estimated_arrival_time (datetime) to microseconds
-            oldest_eta_usec = -1
-            if ct_queue.stats.oldest_estimated_arrival_time:
-                # timestamp() gives seconds as a float, multiply by 1e6 for usec
-                oldest_eta_usec = int(ct_queue.stats.oldest_estimated_arrival_time.timestamp() * 1e6)
-                
-            stats = QueueStatistics(
-                queue=queue,
-                tasks=ct_queue.stats.tasks_count,
-                oldest_eta_usec=oldest_eta_usec,
-                executed_last_minute=ct_queue.stats.executed_last_minute_count,
-                in_flight=ct_queue.stats.concurrent_dispatches_count,
-                enforced_rate=ct_queue.stats.effective_execution_rate
-            )
-          else:
-            # Fallback if the queue has no stats populated
-            stats = QueueStatistics(queue=queue, tasks=0, oldest_eta_usec=-1)
-            
-        except UnknownQueueError:
-          stats = QueueStatistics(queue=queue, tasks=0, oldest_eta_usec=-1)
-        except Exception as e:
-          raise TransientError("Failed to fetch stats: %s" % e)
-        stats._backend_used = 'Cloud Tasks'
-        results.append(stats)
-        
-      res = results if multiple else results[0]
-      
-      if rpc is not None:
-        # Patch the UserRPC object so its get_result returns our CT stats
-        rpc.get_result = lambda: res
-        rpc.check_success = lambda: None
-        rpc.wait = lambda: None
-        return rpc
-      return _SimpleSyncRPC(res)
+      return cls._FetchMultipleQueuesCloudTasks(queues, multiple, rpc)
 
     def ResultHook(rpc):
       """Processes the TaskQueueFetchQueueStatsResponse."""
@@ -1748,12 +1849,17 @@ class Queue(object):
       InvalidQueueNameError: If the queue name is invalid.
     """
 
+
     if not _QUEUE_NAME_RE.match(name):
       raise InvalidQueueNameError(
           'Queue name does not match pattern "%s"; found %s' %
           (_QUEUE_NAME_PATTERN, name))
     self.__name = name
     self.__url = '%s/%s' % (_DEFAULT_QUEUE_PATH, self.__name)
+
+
+
+
 
     self._app = None
 
@@ -1768,9 +1874,9 @@ class Queue(object):
       Error-subclass on application errors.
     """
     if _ShouldUseCloudTasks():
-      project = os.environ.get('GOOGLE_CLOUD_PROJECT')
-      location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
-      path = 'projects/%s/locations/%s/queues/%s:purge' % (project, location, self.__name)
+      project = os.environ.get(_GOOGLE_CLOUD_PROJECT_ENV)
+      location = os.environ.get(_CLOUD_TASKS_LOCATION_ENV, 'us-central1')
+      path = _QUEUE_PURGE_PATH_TEMPLATE % (project, location, self.__name)
       _execute_ct_sync_call('POST', path)
       return
 
@@ -1907,34 +2013,51 @@ class Queue(object):
     """
     return self.delete_tasks_async(task).get_result()
 
-  def __DeleteTasks(self, tasks, multiple, rpc=None):
-    """Internal implementation of delete_tasks_async(), tasks must be a list."""
-    
-    if _ShouldUseCloudTasks():
-      if len(tasks) > 1:
-        raise NotImplementedError("Batch delete is not supported in Cloud Tasks path yet.")
+  @classmethod
+  def __DeleteTasksCloudTasks(self, tasks, multiple, rpc=None):
+    """Internal implementation of delete_tasks_async(), tasks must be a list using Cloud Tasks.
         
-      task = tasks[0]
-      if not task.name:
-        raise BadTaskStateError('A task name must be specified for a task')
-      if task.was_deleted:
-        raise BadTaskStateError('The task %s has already been deleted' % task.name)
-            
-      project = os.environ.get('GOOGLE_CLOUD_PROJECT')
-      location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
-      path = 'projects/%s/locations/%s/queues/%s/tasks/%s' % (project, location, self.__name, task.name)
-      _execute_ct_sync_call('DELETE', path)
-        
-      task._Task__deleted = True
-      task._backend_used = 'Cloud Tasks'
+    Args:
+      tasks: A list of task instances that will be deleted from the queue.
+      multiple: Boolean indicating whether to return a list or a single result.
+      rpc: An optional UserRPC object.
+    """
+
+    if len(tasks) > 1:
+      raise NotImplementedError("Batch delete is not supported in Cloud Tasks path yet.")
       
-      res = tasks if multiple else tasks[0]
-      if rpc is not None:
-        rpc.get_result = lambda: res
-        rpc.check_success = lambda: None
-        rpc.wait = lambda: None
-        return rpc
-      return _SimpleSyncRPC(res)
+    task = tasks[0]
+    if not task.name:
+      raise BadTaskStateError('A task name must be specified for a task')
+    if task.was_deleted:
+      raise BadTaskStateError('The task %s has already been deleted' % task.name)
+          
+    project = os.environ.get(_GOOGLE_CLOUD_PROJECT_ENV)
+    location = os.environ.get(_CLOUD_TASKS_LOCATION_ENV, 'us-central1')
+    path = _TASK_PATH_TEMPLATE % (project, location, self.__name, task.name)
+    _execute_ct_sync_call('DELETE', path)
+      
+    task._Task__deleted = True
+    task._backend_used = 'Cloud Tasks'
+    
+    res = tasks if multiple else tasks[0]
+    if rpc is not None:
+      rpc.get_result = lambda: res
+      rpc.check_success = lambda: None
+      rpc.wait = lambda: None
+      return rpc
+    return _SimpleSyncRPC(res)
+
+  def __DeleteTasks(self, tasks, multiple, rpc=None):
+    """Internal implementation of delete_tasks_async(), tasks must be a list.
+    Args:
+      tasks: A list of task instances that will be deleted from the queue.
+      multiple: Boolean indicating whether to return a list or a single result.
+      rpc: An optional UserRPC object.
+    """
+
+    if _ShouldUseCloudTasks():
+      return self.__DeleteTasksCloudTasks(tasks, multiple, rpc)
 
     def ResultHook(rpc):
       """Processes the TaskQueueDeleteResponse."""
@@ -1955,10 +2078,11 @@ class Queue(object):
       exception = None
       for task, result in zip(tasks, rpc.response.result):
         task._backend_used = 'Legacy TaskQueue'
-        
         if result == taskqueue_service_pb2.TaskQueueServiceError.OK:
+
           task._Task__deleted = True
         elif result in IGNORED_STATES:
+
           task._Task__deleted = False
         elif exception is None:
           exception = _TranslateError(result)
@@ -2264,6 +2388,9 @@ class Queue(object):
     else:
       multiple = True
 
+
+
+
     has_push_task = False
     has_pull_task = False
     for task in tasks:
@@ -2371,8 +2498,8 @@ class Queue(object):
       fill_request(task, request.add_request.add(), transactional)
       add_req = request.add_request[0]
           
-      project = os.environ.get('GOOGLE_CLOUD_PROJECT')
-      location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-central1')
+      project = os.environ.get(_GOOGLE_CLOUD_PROJECT_ENV)
+      location = os.environ.get(_CLOUD_TASKS_LOCATION_ENV, 'us-central1')
       parent, ct_task = _GetTaskForCloudTasks(add_req, project, location)
           
       ct_result = _execute_ct_sync_call('POST', '%s/tasks' % parent, body={'task': ct_task})
@@ -2406,7 +2533,6 @@ class Queue(object):
       exception = None
       for task, task_result in zip(tasks, rpc.response.taskresult):
         task._backend_used = 'Legacy TaskQueue'
-        
         if (task_result.result == taskqueue_service_pb2.TaskQueueServiceError.OK
            ):
           if task_result.HasField('chosen_task_name'):
@@ -2512,6 +2638,13 @@ class Queue(object):
     if task.on_queue_url:
       adjusted_url = self.__url + task.url
 
+
+
+
+
+
+
+
     task_request.method = _METHOD_MAP.get(task.method)
     task_request.url = six.ensure_binary(adjusted_url)
 
@@ -2566,6 +2699,8 @@ class Queue(object):
       task_request.task_name = b''
     if task.tag:
       task_request.tag = six.ensure_binary(task.tag)
+
+
 
     if transactional:
       from google.appengine.api import datastore
@@ -2663,6 +2798,8 @@ class Queue(object):
     if not isinstance(o, Queue):
       return NotImplemented
     return self.name != o.name or self._app != o._app
+
+
 
 
 def add(*args, **kwargs):
